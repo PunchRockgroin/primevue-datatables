@@ -3,6 +3,8 @@
 namespace Savannabits\PrimevueDatatables;
 
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Relations\Relation;
+use Illuminate\Support\Facades\DB;
 
 class Filter
 {
@@ -27,7 +29,7 @@ class Filter
 
     public function __construct(public string $field, public ?string $value = null, public ?string $matchMode = self::CONTAINS)
     {
-        $this->likeOperator = \DB::connection()->getPDO()->getAttribute(\PDO::ATTR_DRIVER_NAME) == 'pgsql' ? 'ILIKE' : 'LIKE';
+        $this->likeOperator = DB::connection()->getPDO()->getAttribute(\PDO::ATTR_DRIVER_NAME) == 'pgsql' ? 'ILIKE' : 'LIKE';
     }
 
     public function buildWhere(Builder &$q, ?bool $or = false)
@@ -89,8 +91,32 @@ class Filter
             }
         }
     }
+
     private function applyWhere(Builder &$q, string $field, ?bool $or = false)
     {
+        // Check if the field is actually a relation method on the model
+        if (method_exists($q->getModel(), $field) && $q->getModel()->{$field}() instanceof Relation) {
+            if ($this->matchMode === self::IN) {
+                $method = $or ? 'orWhereHas' : 'whereHas';
+                $q->{$method}($field, function (Builder $query) {
+                    $relatedKeyName = $query->getModel()->getKeyName();
+                    $tableName = $query->getModel()->getTable();
+                    $query->whereIn($tableName . '.' . $relatedKeyName, explode(',', $this->value));
+                });
+                return;
+            }
+        }
+
+        // --- AMBIGUITY CORRECTION ---
+        // If the field does not contain a period (e.g., 'id' or 'description') and is not a JSON path,
+        // we qualify it with the name of the current model table.
+        // This transforms 'id' into 'evaluations.id' (or the table that is in the context).
+        if (!str_contains($field, '.') && !$this->isJsonFieldPath($field)) {
+            $tableName = $q->getModel()->getTable();
+            $field = $tableName . '.' . $field;
+        }
+        // -------------------------------
+
         $jsonField = $this->isJsonFieldPath($field);
 
         switch ($this->matchMode) {
@@ -180,7 +206,11 @@ class Filter
                 }
                 break;
             case self::IN:
-                //TODO: Implement
+                if ($or) {
+                    $q->orWhereIn($field, explode(',', $this->value));
+                } else {
+                    $q->whereIn($field, explode(',', $this->value));
+                }
                 break;
             case self::LESS_THAN:
                 if ($or) {
@@ -272,7 +302,7 @@ class Filter
      *
      * @param string $field The field string to check.
      * @return array|false Returns an array of path segments if the field is a JSON field path,
-     *                    or false otherwise.
+     * or false otherwise.
      */
     private function isJsonFieldPath(string $field): false|array
     {
